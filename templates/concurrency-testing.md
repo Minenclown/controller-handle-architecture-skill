@@ -1,36 +1,36 @@
 # Concurrency-Testing Template (Controller+Handle)
 
-Race-Condition-Tests für Controller+Handle im Multi-User-Kontext.
-Nur relevant für Server-Deployments (5+ gleichzeitige User).
-Single-User-Desktops brauchen diese Tests nicht.
+Race condition tests for Controller+Handle in multi-user contexts.
+Only relevant for server deployments (5+ concurrent users).
+Single-user desktops do not need these tests.
 
-Siehe auch: O4 (Circuit Breaker), O8 (Metrics/Observability),
-Skalierungs-Achsen — Achse 3 (funktional/mehr User).
+See also: O4 (Circuit Breaker), O8 (Metrics/Observability),
+Scaling Axes — Axis 3 (functional/more users).
 
-## Was zu testen
+## What to Test
 
-1. **Concurrent Register** — Mehrere Threads registrieren gleichzeitig
-   Handles. Ergebnis: alle Handles registriert, keine doppelten IDs,
-   keine verlorenen Registrationen.
+1. **Concurrent Register** — Multiple threads register handles
+   simultaneously. Expected: all handles registered, no duplicate IDs,
+   no lost registrations.
 
-2. **Concurrent Get** — Mehrere Threads rufen gleichzeitig `get_handle()`
-   auf. Ergebnis: korrekter Handle zurückgegeben, keine Exceptions
-   bei valid IDs.
+2. **Concurrent Get** — Multiple threads call `get_handle()`
+   simultaneously. Expected: correct handle returned, no exceptions
+   for valid IDs.
 
-3. **Concurrent Metrics Increment** — Mehrere Threads rufen `call()` auf
-   demselben Handle. Ergebnis: Counter-Inkremente stimmen exakt
-   (O8 Thread-Safety).
+3. **Concurrent Metrics Increment** — Multiple threads call `call()` on
+   the same handle. Expected: counter increments match exactly
+   (O8 thread safety).
 
-4. **Concurrent Circuit Breaker** — Mehrere Threads triggern gleichzeitig
-   `record_failure()` und `record_success()`. Ergebnis: Breaker tripped
-   nicht fälschlich bei concurrent success, trippt korrekt bei
-   threshold-Kreuzung (O4).
+4. **Concurrent Circuit Breaker** — Multiple threads trigger
+   `record_failure()` and `record_success()` simultaneously. Expected:
+   breaker does not trip falsely on concurrent success, trips correctly
+   at threshold crossing (O4).
 
-5. **Concurrent Reload** — Ein Thread ruft `reload()` während andere
-   Threads `get_handle()` aufrufen. Ergebnis: keine Exception, keine
-   verlorenen Handles (S2 Copy-on-Write).
+5. **Concurrent Reload** — One thread calls `reload()` while other
+   threads call `get_handle()`. Expected: no exception, no lost
+   handles (S2 Copy-on-Write).
 
-## Python Test-Patterns
+## Python Test Patterns
 
 ```python
 import threading
@@ -52,7 +52,7 @@ class FakeSearchHandle:
 # --- 1. Concurrent Register ---
 
 def test_concurrent_register():
-    from kb.controllers.base import Controller
+    from app.controllers.base import Controller
 
     ctrl = Controller("TestController")
     barrier = threading.Barrier(3)
@@ -81,7 +81,7 @@ def test_concurrent_register():
 # --- 2. Concurrent Get ---
 
 def test_concurrent_get():
-    from kb.controllers.base import Controller
+    from app.controllers.base import Controller
 
     ctrl = Controller("TestController")
     for i in range(5):
@@ -111,7 +111,7 @@ def test_concurrent_get():
 # --- 3. Concurrent Metrics Increment ---
 
 def test_concurrent_metrics_increment():
-    from kb.controllers.base import Controller
+    from app.controllers.base import Controller
 
     ctrl = Controller("TestController")
     ctrl.register(FakeSearchHandle("test"))
@@ -134,7 +134,7 @@ def test_concurrent_metrics_increment():
 # --- 4. Concurrent Circuit Breaker ---
 
 def test_concurrent_circuit_breaker():
-    from kb.controllers.circuit_breaker import CircuitBreaker
+    from app.controllers.circuit_breaker import CircuitBreaker
 
     breaker = CircuitBreaker(threshold=3, window_sec=30, cooldown_sec=60)
     barrier = threading.Barrier(5)
@@ -159,7 +159,7 @@ def test_concurrent_circuit_breaker():
 
 
 def test_concurrent_circuit_breaker_success():
-    from kb.controllers.circuit_breaker import CircuitBreaker
+    from app.controllers.circuit_breaker import CircuitBreaker
 
     breaker = CircuitBreaker(threshold=3, window_sec=30, cooldown_sec=60)
     barrier = threading.Barrier(5)
@@ -190,7 +190,7 @@ def test_concurrent_circuit_breaker_success():
 # --- 5. Concurrent Reload (Copy-on-Write) ---
 
 def test_concurrent_reload_and_get():
-    from kb.controllers.base import Controller
+    from app.controllers.base import Controller
 
     ctrl = Controller("TestController")
     ctrl.register(FakeSearchHandle("h0"))
@@ -231,7 +231,7 @@ def test_concurrent_reload_and_get():
     assert not errors, f"Unexpected errors: {errors}"
 ```
 
-## Java Test-Patterns
+## Java Test Patterns
 
 ```java
 import org.junit.jupiter.api.Test;
@@ -242,7 +242,7 @@ import java.util.Collection;
 import java.util.IntSummaryStatistics;
 import static org.junit.jupiter.api.Assertions.*;
 
-// FakeHandle für Tests
+// FakeHandle for tests
 class FakeXHandle implements XHandle {
     private final String id;
     FakeXHandle(String id) { this.id = id; }
@@ -412,23 +412,23 @@ class ConcurrencyTest {
 }
 ```
 
-## Wann diese Tests geschrieben werden
+## When to Write These Tests
 
-| Deployment | Concurrency-Tests nötig? | Begründung |
-|------------|--------------------------|------------|
-| Single-User Desktop (Private) | Nein | GIL/Single-Thread reicht |
-| Multi-User Server (Professional) | Ja | 5+ User = Race Conditions möglich |
-| Gameserver (10+ gleichzeitige Spieler) | Ja | Concurrent register/get/getHandle |
-| REST API mit Multi-Tenant | Ja | Session-Routing + Reload + Metrics |
+| Deployment | Concurrency Tests Needed? | Reason |
+|------------|---------------------------|--------|
+| Single-User Desktop (Private) | No | GIL/Single-Thread sufficient |
+| Multi-User Server (Professional) | Yes | 5+ users = race conditions possible |
+| Game Server (10+ concurrent players) | Yes | Concurrent register/get/getHandle |
+| REST API with Multi-Tenant | Yes | Session routing + reload + metrics |
 
-## Thread-Safety-Primitives Referenz
+## Thread-Safety Primitives Reference
 
-| Sprache | Map | Counter | Atomic Swap |
-|---------|-----|---------|-------------|
-| Python | `dict` + `threading.Lock` | `collections.Counter` oder `Lock` | `self._handles = new_handles` (GIL-atomar für Dict-Referenz) |
-| Java | `ConcurrentHashMap` | `AtomicInteger` / `AtomicLong` | `AtomicReference<Map>` für COW |
-| Rust | `DashMap` oder `RwLock<HashMap>` | `AtomicUsize` | `Arc<Swap<Map>>` |
-| Go | `sync.Map` | `atomic.Int64` | Wertetausch per `atomic.Value` |
+| Language | Map | Counter | Atomic Swap |
+|----------|-----|---------|-------------|
+| Python | `dict` + `threading.Lock` | `collections.Counter` or `Lock` | `self._handles = new_handles` (GIL-atomic for dict reference) |
+| Java | `ConcurrentHashMap` | `AtomicInteger` / `AtomicLong` | `AtomicReference<Map>` for COW |
+| Rust | `DashMap` or `RwLock<HashMap>` | `AtomicUsize` | `Arc<Swap<Map>>` |
+| Go | `sync.Map` | `atomic.Int64` | Swap via `atomic.Value` |
 
-Siehe auch O4 (Circuit Breaker), O8 (Metrics), S2 (Copy-on-Write für Reload)
-in der SKILL.md.
+See also O4 (Circuit Breaker), O8 (Metrics), S2 (Copy-on-Write for Reload)
+in SKILL.md.
