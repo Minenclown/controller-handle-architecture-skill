@@ -9,6 +9,11 @@ wired to the event bus.
 All identifiers use abstract placeholder names (DOMAIN_A_*, DOMAIN_B_*, etc.)
 so the template can be adapted to any project without leaking domain
 assumptions.
+
+Thread safety: the EnhancedController's metrics counters use a threading.Lock
+because compound dict operations (check-then-set: ``d[k] = d.get(k, 0) + 1``)
+are NOT atomic even under CPython's GIL. In a multi-threaded server (FastAPI,
+uvicorn workers) concurrent increments without a lock silently lose data.
 """
 
 # === Lifecycle Protocol ===
@@ -157,6 +162,7 @@ class HandleIds:
 
 from typing import TypeVar, Generic, Dict, List, Optional
 import logging
+import threading
 
 H = TypeVar("H")
 logger = logging.getLogger(__name__)
@@ -208,6 +214,7 @@ class EnhancedController(Generic[H]):
         self._call_counts: Dict[str, int] = {}
         self._error_counts: Dict[str, int] = {}
         self._breakers: Dict[str, CircuitBreaker] = {}
+        self._metrics_lock = threading.Lock()  # protects _call_counts/_error_counts
 
     # --- registration ------------------------------------------------
 
@@ -259,7 +266,8 @@ class EnhancedController(Generic[H]):
 
     def call(self, handle_id: str, method_name: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke *method_name* on *handle_id*, tracking metrics and breaker."""
-        self._call_counts[handle_id] = self._call_counts.get(handle_id, 0) + 1
+        with self._metrics_lock:
+            self._call_counts[handle_id] = self._call_counts.get(handle_id, 0) + 1
         handle = self.get_handle(handle_id)
         method = getattr(handle, method_name)
         try:
@@ -267,16 +275,20 @@ class EnhancedController(Generic[H]):
             self._breakers[handle_id].record_success()
             return result
         except Exception:
-            self._error_counts[handle_id] = self._error_counts.get(handle_id, 0) + 1
+            with self._metrics_lock:
+                self._error_counts[handle_id] = self._error_counts.get(handle_id, 0) + 1
             self._breakers[handle_id].record_failure()
             raise
 
     def get_metrics(self) -> Dict[str, Any]:
         """Return per-handle call/error counts and current breaker state."""
+        with self._metrics_lock:
+            counts = dict(self._call_counts)
+            errors = dict(self._error_counts)
         return {
             hid: {
-                "calls": self._call_counts.get(hid, 0),
-                "errors": self._error_counts.get(hid, 0),
+                "calls": counts.get(hid, 0),
+                "errors": errors.get(hid, 0),
                 "tripped": self._breakers[hid].is_tripped() if hid in self._breakers else False,
             }
             for hid in self.get_handle_ids()
