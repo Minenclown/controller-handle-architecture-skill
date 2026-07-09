@@ -2,10 +2,12 @@
 name: controller-handle-architecture
 category: software-development
 description: |
-  Scalable architecture following the Controller-Handle-Interface pattern.
-  Language-agnostic architecture pattern. Designed to avoid
-  over-engineering while remaining adaptive and maintaining clear structure
-  across any program.
+  Use when refactoring or generating code with multiple runtime-selectable
+  providers, modes, engines, backends, handlers, listeners, commands, or
+  feature implementations. Especially useful when code currently contains
+  if/else dispatch trees, god managers, duplicated managers, hard-coded
+  provider selection, or plugin-like extensibility requirements. Do not use
+  for 1-2 static implementations.
 ---
 
 # Controller-Handle-Interface Architecture
@@ -23,7 +25,7 @@ dynamically, zero if/else dispatch trees.
 - Listeners, event handlers, or commands should be decoupled from
   business logic
 
-## When NOT to Apply This Skill
+## When NOT to Apply This Skill — Simplify Alternatives
 
 Use this decision matrix first. Applying the pattern to simple projects
 is over-engineering.
@@ -46,6 +48,20 @@ Do you need more than ID lookup                No      Strategy pattern suffices
 Is the project multi-threaded/server?          No      Core-10 suffices
                                                Yes     Core-10 + Thread-Safety
 ```
+
+**If the pattern is not justified, do NOT implement Controller+Handle.
+Use the simpler alternative instead:**
+
+| Situation | Use Instead |
+|-----------|-------------|
+| 1 implementation | Direct service class, no abstraction |
+| 2 static implementations | Interface + factory method |
+| Fixed set, never changes | Enum + switch/map |
+| All similar handlers (5 listeners) | Single dispatcher, not one controller each |
+| Config choice (dark mode, locale) | Config file or boolean, not a handle |
+
+When in doubt, start simpler. You can always refactor toward
+Controller+Handle when the third implementation arrives.
 
 ### Rule of Three for Entry
 
@@ -215,31 +231,41 @@ This skill contains copy-paste templates for three languages:
 - `templates/java_optimizations.java` — Lifecycle, EventBus, CircuitBreaker, Reloadable, HandleIds, ControllerMetrics, EnhancedController
 - `templates/python_optimizations.py` — same optimizations, Python-idiomatic
 
-## Step-by-Step: Setting Up a New Project
+## Agent Workflow
 
-1. **Identify domains** — What functional areas exist? (e.g., Search,
-   Storage, Rendering, Sync)
+When using this skill, follow this sequence. Do not skip steps.
 
-2. **Per domain: define Handle protocol** — What methods does the domain
-   need? Only `get_id()` is mandatory; the rest is domain-specific.
+1. **Inspect existing code** — Read the codebase before generating
+   abstractions. Identify what exists: services, managers, dispatch logic,
+   config structures.
 
-3. **Write Controller** — Copy the template once, add domain-specific
-   convenience methods.
+2. **Identify candidate domains** — List functional areas that have 3+
+   runtime-selectable implementations or modes. If none: stop, do not
+   apply this pattern.
 
-4. **Implement Concrete Handles** — Wrap existing services/classes. Use
-   lazy imports for heavy dependencies.
+3. **Apply the Rule of Three** — For each candidate domain, count
+   genuinely different, runtime-extensible implementations. If fewer
+   than 3, use a simpler design (see Simplify Alternatives below).
 
-5. **Write Composition Root** — Instantiate all controllers, register all
-   handles. Make it idempotent.
+4. **If the pattern is not justified, say so** — Explicitly state why a
+   simpler design suffices and use that instead. Do not implement
+   Controller+Handle "just in case."
 
-6. **Wire Event Handlers/Listeners/Commands to Controllers** — Instead
-   of `if (isInX())` → `if (controller.isAllowed(...))`.
+5. **For each justified domain, generate:**
+   - One Handle interface/protocol (with `get_id()` and domain methods)
+   - One Controller (registry + domain-specific convenience methods)
+   - Concrete Handles (wrapping existing services, not replacing them)
+   - One Composition Root (idempotent `init_controllers()`)
 
-7. **Create Config Files** — Outsource rules, categories, modes to
-   YAML/JSON. Generate defaults when files are missing.
+6. **Preserve existing services** — Wrap, don't delete. Existing classes
+   stay in place; handles delegate to them.
 
-8. **Write Tests** — Reset controller registry, register handles, test
-   the API. See Testing Guidance below.
+7. **Wire listeners to controllers** — Replace `if (mode == X)` with
+   `controller.is_allowed(...)`. Listeners query the controller, never
+   concrete handle IDs.
+
+8. **Write tests** — See Minimum Code Output below for the required
+   test coverage.
 
 ## When to Add a New Handle vs. a New Method
 
@@ -253,6 +279,43 @@ This skill contains copy-paste templates for three languages:
   consider splitting it into two handles.
 - **Guideline:** 3-7 handles per controller is a healthy range. Too many
   handles with 1 method each is also over-engineering.
+
+## Bad → Good Transformations
+
+Common code smells and how Controller+Handle resolves them:
+
+**if/else provider dispatch:**
+```
+Bad:   if provider == "alpha": return alpha.search(q)
+       elif provider == "beta": return beta.search(q)
+       elif provider == "gamma": return gamma.search(q)
+
+Good:  search_ctrl.get_handle(provider).search(q)
+```
+
+**God Manager:**
+```
+Bad:   class MegaManager:
+           def search(self, q): ...
+           def store(self, data): ...
+           def render(self, view): ...
+           def sync(self, src, dst): ...
+
+Good:  search_ctrl.get_handle(id).search(q)
+       store_ctrl.get_handle(id).store(data)
+       render_ctrl.get_handle(id).render(view)
+       sync_ctrl.get_handle(id).sync(src, dst)
+```
+
+**Listener knows concrete implementation:**
+```
+Bad:   if current_mode == "advanced":
+           advanced_engine.process(data)
+       else:
+           basic_engine.process(data)
+
+Good:  engine_ctrl.get_primary().process(data)
+```
 
 ## Anti-Patterns (Avoid)
 
@@ -319,6 +382,28 @@ This skill contains copy-paste templates for three languages:
 - **Integration vs. unit:** Controller tests are unit tests (fake handles).
   Handle tests are unit tests (fake services). Composition root tests are
   integration (real handles, real services).
+
+## Minimum Code Output
+
+When applying this pattern to a domain, you MUST generate at minimum:
+
+- **Handle interface/protocol** — with `get_id()` and domain methods
+- **Controller** — registry with `register`, `get_handle`, `has_handle`,
+  and domain-specific convenience methods
+- **At least one concrete handle** — wrapping an existing service if one
+  exists, standalone otherwise
+- **Composition root** — `init_controllers()` function that instantiates
+  controllers, registers handles, and is idempotent
+- **Tests for:**
+  - `register()` adds a handle, `get_handle()` returns it
+  - `get_handle("unknown_id")` throws (fail-fast)
+  - Insertion order is preserved (first registered = primary)
+  - `unregister()` removes cleanly
+  - `init_controllers()` is idempotent (calling twice = no double
+    registration)
+
+Do not generate only the interface without the composition root, or
+only the controller without tests. All five elements are required.
 
 ## Progressive Enhancements (O1-O8)
 
@@ -886,6 +971,24 @@ parallelized efficiently:
 - **Pitfall:** Fake modules injected into the module system (for mock
   tests) contaminate subsequent tests that import real modules. Solution:
   dedicated cleanup functions or isolated test files.
+
+## Review Checklist
+
+When reviewing generated Controller+Handle code, reject or revise if:
+
+- [ ] A handle fetches controllers from a global registry instead of
+  receiving dependencies via constructor injection
+- [ ] A listener references concrete handle IDs instead of querying the
+  controller
+- [ ] Existing services were deleted instead of wrapped
+- [ ] `get_handle("unknown_id")` returns null/None instead of throwing
+- [ ] Registration silently overwrites duplicate IDs without warning
+- [ ] The controller contains domain business logic instead of delegating
+  to handles
+- [ ] The composition root is spread across multiple unrelated files
+- [ ] Tests share global controller state without reset in setup/teardown
+- [ ] Handle IDs are hardcoded strings instead of constants or enums
+- [ ] `get_handles()` returns the internal dict reference instead of a copy
 
 ## References
 
