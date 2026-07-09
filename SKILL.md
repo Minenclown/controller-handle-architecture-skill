@@ -165,9 +165,12 @@ The pattern uses a Composition Root (good). The line to Service Locator
 - **The rule:** Controllers may know other controllers (via the
   composition root). Handles must NOT know controllers. Handles receive
   dependencies via constructor, not via lookup.
-- **Exception:** Composite handles (O5) depend on the controller — this
-  is a known compromise. Alternative: pass sub-handles to the composite
-  handle via constructor instead of having it look them up.
+- **Exception:** Composite handles (O5) that delegate to other handles
+  SHOULD receive sub-handles via constructor injection from the
+  composition root. Only if sub-handles are registered dynamically at
+  runtime or circular load order makes this impossible may a composite
+  handle resolve from the controller at call time — this is the Service
+  Locator anti-pattern applied narrowly and must be documented. See O5.
 
 ## Pattern Relationships
 
@@ -274,8 +277,11 @@ This skill contains copy-paste templates for three languages:
   bound. Type-safety is not lost due to structural typing. If your
   language has no structural typing, this pitfall does not apply.
 - **Composite handle creates new instances** — A handle that delegates
-  to other handles should obtain registered instances from the
-  controller, not call `new SubHandle()`. See O5.
+  to other handles should receive them via constructor injection from
+  the composition root, not create new instances. See O5. Only if
+  constructor injection is impossible (dynamic registration, circular
+  load order) may the handle resolve from the controller at call time —
+  this is a documented compromise, not the default.
 - **Controller Inflation** — Too many controllers for too few domains.
   One controller per domain, not per feature. "Storage" is a domain;
   "PostgreSQL" is a feature within it — not its own controller.
@@ -433,20 +439,48 @@ Controller integration (additive, non-breaking):
 **When:** Multi-user server where one handle failure shouldn't block all
 users. Single-user CLI: YAGNI — `is_available()` suffices.
 
-### O5: Resolve Handle Dependencies via Controller
+### O5: Inject Sub-Handle Dependencies via Composition Root
 
-A composite handle that delegates to other handles should obtain them
-from the controller, not create new instances:
+A composite handle that delegates to other handles should receive them
+via constructor injection from the composition root, not create new
+instances and not look them up from the registry:
 
 ```python
 # Bad — creates new instances, state is inconsistent
-sub_handle = SubHandle()
+sub_handle = SubHandle()  # new instance each call
 
-# Good — obtains the registered instance
-from app.controllers.registry import get_controller_registry
-ctrl = get_controller_registry().get_controller("domain_a")
-sub_handle = ctrl.get_handle("sub_handle_id")
+# Good — constructor injection from composition root
+class CompositeHandle(DomainHandle):
+    def __init__(self, sub_handle: SubHandleInterface):
+        self._sub_handle = sub_handle
+
+# In the composition root (the ONLY place that talks to the registry):
+sub = domain_a_controller.get_handle("sub_handle_id")
+composite = CompositeHandle(sub_handle=sub)
+domain_b_controller.register(composite)
 ```
+
+This follows the core rule: handles receive dependencies via constructor,
+not via lookup. The composition root is the sole place that wires things.
+
+**Exception — lazy resolution at runtime:** If sub-handles are registered
+dynamically at runtime (not available at composition-root time) or
+circular load order makes constructor injection impossible, a composite
+handle MAY resolve dependencies from the controller at call time:
+
+```python
+# Exception — only when constructor injection is impossible
+def delegate(self, kb_path, vault_path, **kwargs):
+    from app.controllers.registry import get_controller_registry
+    ctrl = get_controller_registry().get_controller("sync")
+    sub = ctrl.get_handle("sub_handle_id")
+    return sub.do_work(...)
+```
+
+This is a conscious compromise of the "no handle knows controllers" rule
+(see Composition Root vs Service Locator). It is the Service Locator
+anti-pattern applied narrowly. Prefer constructor injection wherever
+possible. Document the reason if you use this exception.
 
 **When:** Composite handles exist. No composite handles: YAGNI.
 
@@ -546,6 +580,15 @@ class Controller(Generic[H]):
 **When:** Multi-user server needing admin diagnostics. Single-user CLI:
 YAGNI — `print()` / `journalctl` suffices.
 
+**Thread safety (multi-user server):** Counters are written at runtime
+from multiple threads. In Python, CPython's GIL makes simple integer
+increments (`+= 1`) implicitly safe, but compound dict operations
+(check-then-set) are NOT atomic — use a `threading.Lock` or
+`collections.Counter`. In Java, use `AtomicInteger` and
+`ConcurrentHashMap` instead of primitive `int` and `HashMap`. For
+multi-user servers, ensure the counters use thread-safe primitives
+(Lock in Python, AtomicInteger in Java).
+
 ## Enhancement Prioritization
 
 Prioritization depends on deployment context. A single-user desktop app
@@ -555,7 +598,7 @@ has different requirements than a multi-user server.
 
 | # | Enhancement | Impact | Effort | Recommendation |
 |---|------------|--------|--------|---------------|
-| O5 | Handle dependencies via controller | High | Low | Yes — quick fix |
+| O5 | Sub-handle injection via comp. root | High | Low | Yes — quick fix |
 | O7 | Typed handle IDs | Medium | Low | Yes — quick fix |
 | O6 | Unified reload | Low | Low | YAGNI — app restart suffices |
 | O8 | Metrics / observability | Low | Low | YAGNI — print/journalctl suffices |
@@ -568,7 +611,7 @@ has different requirements than a multi-user server.
 
 | # | Enhancement | Impact | Effort | Recommendation |
 |---|------------|--------|--------|---------------|
-| O5 | Handle dependencies via controller | High | Low | Yes — quick fix |
+| O5 | Sub-handle injection via comp. root | High | Low | Yes — quick fix |
 | O7 | Typed handle IDs | High | Low | Yes — prevents typos |
 | O6 | Unified reload | High | Low | Yes — no restart on config change |
 | O8 | Metrics / observability | High | Low | Yes — admin diagnostics |
@@ -798,7 +841,11 @@ When multi-threaded:
 - **When relevant:** Only for multi-threaded (server, web server,
   event-driven). Single-thread (CLI, plugin main thread): YAGNI.
 - **Circuit breaker and metrics:** If implemented, these are written at
-  runtime and MUST be thread-safe regardless of the handle map.
+  runtime and MUST be thread-safe regardless of the handle map. In Python,
+  CPython's GIL makes simple `+= 1` safe, but compound dict operations
+  (check-then-set) are NOT atomic — use `threading.Lock` or
+  `collections.Counter`. In Java, use `AtomicInteger` and
+  `ConcurrentHashMap`. See O8 and S3.
 
 ## Multi-Instance Session Routing
 
