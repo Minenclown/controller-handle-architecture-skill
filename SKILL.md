@@ -63,16 +63,24 @@ Use the simpler alternative instead:**
 When in doubt, start simpler. You can always refactor toward
 Controller+Handle when the third implementation arrives.
 
-### Rule of Three for Entry
+## Fast Path — What You Need for Simple Cases
 
-- **1-2 domains?** You don't need a controller. A simple interface
-  implementation or factory suffices.
-- **3+ domains, but all similar (e.g., 5 listeners)?** You don't need a
-  controller per domain. A single dispatcher suffices.
-- **3+ domains, different, but static (never change)?** You don't need
-  dynamic registration. An enum + switch suffices.
-- **3+ domains, different, AND runtime-extensible (without code changes)?**
-  THEN use Controller+Handle.
+When the pattern is justified for 2-3 domains, reading the following
+sections is sufficient:
+
+- Core Design Principles 1-10
+- Java Template OR Python Template (not both)
+- Bad → Good Transformations
+- Anti-Patterns
+- Minimum Code Output
+- Testing Guidance
+
+The Enhancement Layer (O1-O8), Scaling (S1-S6), Composition Root
+vs. Service Locator, and all reference files are progressive
+enhancement — load only when the corresponding pain point exists.
+The skill is deliberately structured this way: core principles come
+first, enhancements come after. Don't read everything at once when
+you're only doing a simple Controller+Handle refactor.
 
 ## The Pattern in 3 Layers
 
@@ -152,6 +160,17 @@ you are solving a specific problem that requires it."
 
 7. **Fail-Fast on Unknown Handles** — `getHandle("unknown")` throws an
    exception. No silent null return. Callers must provide valid IDs.
+
+   Exception: Plugin systems with optional extensions. When a handle may
+   be optional, callers MUST check `has_handle()` before calling
+   `get_handle()` — silent null remains forbidden, but graceful
+   degradation via `has_handle()` + explicit fallback is allowed.
+   Example: a backup handle in a plugin system where the backup plugin is
+   optionally installed and not part of core functionality.
+
+   Rule: When ALL handles are mandatory → fail-fast (default). When some
+   handles are optional → `has_handle()` + explicit fallback. Never return
+   silent null without checking.
 
 8. **Decouple Listeners/Event Handlers** — Listeners query only the
    controller, never concrete implementations. Example:
@@ -382,6 +401,12 @@ Good:  engine_ctrl.get_primary().process(data)
 - **Integration vs. unit:** Controller tests are unit tests (fake handles).
   Handle tests are unit tests (fake services). Composition root tests are
   integration (real handles, real services).
+- **Concurrency tests (for server deployments):** When the system runs in
+  a multi-user context, test concurrent access to controllers.
+  See `templates/concurrency-testing.md` for complete test patterns
+  (Python + Java): concurrent register, concurrent get, concurrent metrics
+  increment (O8), concurrent circuit breaker trip (O4), concurrent reload
+  (S2 Copy-on-Write). Single-user desktops do not need these tests.
 
 ## Minimum Code Output
 
@@ -437,6 +462,13 @@ need explicit setup/cleanup. Stateless handles: YAGNI.
 
 ### O2: Inter-Controller Communication via Event Bus
 
+Trigger: 3+ controllers reference each other directly
+(DomainAController → DomainBController.switchMode(),
+DomainCController → DomainAController.debit(),
+DomainDController → DomainBController.update()). When fewer than
+3 controller cross-references exist, direct access via the composition
+root is preferable to an event bus.
+
 When controllers need to communicate, direct access (`plugin.getXController()`)
 couples them. An event bus decouples this.
 
@@ -461,6 +493,12 @@ to existing events without modifying the emitter.
 reference each other). Single domain or 2 controllers: YAGNI.
 
 ### O3: Capability Resolution Instead of ID Lookup
+
+Trigger: A controller has 5+ hardcoded `get_handle(id)` calls
+OR handles have overlapping capabilities (two indexers that both
+support .pdf) and the caller shouldn't need to know WHICH handle
+does the work. Under 5 `get_handle` calls with unambiguous IDs,
+simple ID lookup suffices.
 
 Instead of `get_handle("pdf")`, handles declare what they can do and
 controllers search by capability:
@@ -982,6 +1020,7 @@ When reviewing generated Controller+Handle code, reject or revise if:
   controller
 - [ ] Existing services were deleted instead of wrapped
 - [ ] `get_handle("unknown_id")` returns null/None instead of throwing
+  (EXCEPT for optional plugin handles with `has_handle()` check in the caller)
 - [ ] Registration silently overwrites duplicate IDs without warning
 - [ ] The controller contains domain business logic instead of delegating
   to handles
@@ -1010,6 +1049,9 @@ Copy-paste templates are provided for common languages:
 - `templates/typescript_template.ts` — same structure for frontend/Tauri
 - `templates/java_optimizations.java` — Lifecycle, EventBus, CircuitBreaker, Reloadable, Metrics
 - `templates/python_optimizations.py` — same optimizations, Python-idiomatic
+- `templates/concurrency-testing.md` — Race condition tests for multi-user
+  servers (Python + Java): concurrent register, get, metrics, circuit breaker,
+  reload. Only relevant for server deployments, not single-user desktops.
 
 Templates for additional languages (Rust, Go, Kotlin, etc.) follow the
 same principles. Translate the concepts, not the syntax:
