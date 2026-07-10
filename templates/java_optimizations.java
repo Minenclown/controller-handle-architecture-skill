@@ -1,3 +1,6 @@
+// REFERENCE SNIPPETS — not a compilable Java source file.
+// Split each type into its own file and adapt placeholders.
+
 // === Lifecycle Interface ===
 
 public interface HandleLifecycle {
@@ -134,7 +137,11 @@ public abstract class EnhancedController implements Reloadable {
     protected final Map<String, CircuitBreaker> breakers = new HashMap<>();
 
     public void registerHandle(DomainHandle handle) {
-        handles.put(handle.getId(), handle);
+        String id = handle.getId();
+        if (handles.containsKey(id)) {
+            throw new IllegalArgumentException("Handle already registered: " + id);
+        }
+        handles.put(id, handle);
         if (handle instanceof HandleLifecycle) {
             ((HandleLifecycle) handle).onRegister();
         }

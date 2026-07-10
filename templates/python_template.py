@@ -3,8 +3,12 @@
 # Generic controller-handle architecture template.
 # All names are abstract/generic — replace DomainController, DomainHandle,
 # ConcreteDomainHandle, and ProviderEngine with your own domain concepts.
+#
+# WARNING: get_controller_registry() and similar global getters are for
+# the COMPOSITION ROOT only. Handles must NOT call them. Use constructor
+# injection for handle dependencies.
 
-from typing import TypeVar, Generic, Dict, List, Optional, Protocol, runtime_checkable
+from typing import TypeVar, Generic, Dict, List, Optional, Protocol, runtime_checkable, Callable, Any
 import logging
 
 H = TypeVar("H")
@@ -53,17 +57,23 @@ class HandleBase(Protocol):
     """Base protocol every handle must satisfy."""
 
     def get_id(self) -> str: ...
-
-    def get_display_name(self) -> str: ...
+    # Only get_id() is part of the base contract.
+    # get_display_name() is optional for UI/logging — add it to
+    # domain-specific handle protocols where it's actually needed.
 
 
 # === Domain-Specific Handle Protocol ===
+# Only get_id() is required. get_display_name() is NOT in the protocol
+# because Python Protocol methods are mandatory. If you need display names,
+# use a separate optional protocol:
 
+@runtime_checkable
+class DisplayNamedHandle(Protocol):
+    def get_display_name(self) -> str: ...
 
 @runtime_checkable
 class DomainHandle(HandleBase, Protocol):
     """Protocol for handles that expose a domain operation."""
-
     def execute(self, query: str, limit: int = 20, **kwargs) -> list[dict]: ...
 
 
@@ -97,6 +107,10 @@ class ProviderEngine:
 
     In a real application this would be imported from your provider
     package.  It is kept inline here so the template is self-contained.
+
+    Note: The class itself is passed as a factory callable to handles.
+    Remove get_instance() if you don't need a global singleton — the
+    handle gets the engine via the injected factory, not via a lookup.
     """
 
     _instance: Optional["ProviderEngine"] = None
@@ -113,7 +127,20 @@ class ProviderEngine:
 
 
 class ConcreteDomainHandle:
-    """Concrete handle that lazily delegates to a ProviderEngine."""
+    """Concrete handle that lazily delegates to a ProviderEngine.
+
+    The engine is provided via a factory callable injected at construction
+    time, making the dependency explicit and testable — no global lookup."""
+
+    def __init__(self, engine_factory: Callable[[], Any]) -> None:
+        self._engine_factory = engine_factory
+        self._engine: Any = None
+
+    def _get_engine(self):
+        # Lazy init via injected factory — dependency is explicit, not a global lookup
+        if self._engine is None:
+            self._engine = self._engine_factory()
+        return self._engine
 
     def get_id(self) -> str:
         return "provider"
@@ -122,13 +149,13 @@ class ConcreteDomainHandle:
         return "Provider Engine"
 
     def execute(self, query: str, limit: int = 20, **kwargs) -> list[dict]:
-        engine = ProviderEngine.get_instance()
+        engine = self._get_engine()
         return [engine.execute(query, limit=limit, **kwargs)]
 
     def is_available(self) -> bool:
-        """Best-effort availability check without importing the engine eagerly."""
+        """Best-effort availability check without instantiating the engine eagerly."""
         try:
-            ProviderEngine.get_instance()
+            self._get_engine()
             return True
         except Exception:
             return False
@@ -198,7 +225,9 @@ def init_controllers() -> None:
 
 
 def _register_domain_handles(ctrl: DomainController) -> None:
-    ctrl.register(ConcreteDomainHandle())
+    # Factory injection: pass the factory callable, not a global singleton lookup.
+    # The handle lazily calls engine_factory() on first use.
+    ctrl.register(ConcreteDomainHandle(engine_factory=ProviderEngine))
 
 
 def reset_controllers() -> None:

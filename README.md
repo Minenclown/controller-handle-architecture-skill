@@ -10,9 +10,10 @@ A proven architecture pattern — not a framework, not a library. You copy
 the templates into your project and adapt them. No dependencies, no
 runtime, no build step.
 
-**Battle-tested in two production projects:**
-- A multi-user knowledge-base server (Python, 6 controllers, 14 handles, 355 tests)
-- A Minecraft game plugin (Java, 8 controllers, 8MB JAR)
+**Battle-tested in production:**
+- A multi-user server system (Python, 8 controllers, 14+ handles, 355+ tests)
+- A game plugin (Java, 8 controllers, 18 listeners migrated)
+- A wallet modernization (Python, 5 controllers, feature-toggle system, 177 tests)
 
 ## The Problem It Solves
 
@@ -40,57 +41,85 @@ Composition Root  →  instantiates controllers, registers handles
 ConcreteHandle    →  wraps an existing service or stands alone
 ```
 
-New feature? `controller.register(new Handle())`. No existing code
-changes. Open/Closed Principle enforced by structure, not discipline.
+New feature? `controller.register(new Handle())`. No changes to existing
+controller or dispatch logic; only the composition root is extended.
+Open/Closed Principle enforced by structure, not discipline.
 
 ## When to Use It
 
-- New project with 3+ distinct functional domains
+- At least one domain has 3+ runtime-selectable implementations
+  (e.g. 3 search engines, 3 render modes, 3 storage backends)
 - Refactoring a grown codebase with if/else dispatch trees or
   duplicated manager classes
-- Features must be extensible at runtime without code changes
+- New implementations should be addable without modifying existing
+  controller or dispatch logic. The composition root MAY be extended.
+  Hot-plugging (runtime registration without code changes) is NOT a
+  prerequisite — it requires O6 Reload or dynamic plugin registration.
 
 ## When NOT to Use It
 
-- 1-2 domains → a simple interface suffices
-- Static domains that never change → an enum + switch suffices
-- All domains are similar (5 listeners doing the same thing) → a single
-  dispatcher suffices
+- 1-2 implementations in a domain → a simple interface suffices
+- Static implementations that never change → an enum + switch suffices
+- All implementations are similar (5 listeners doing the same thing) → a
+  single dispatcher suffices
 
-**Rule of Three:** 3+ domains, genuinely different, AND
-runtime-extensible → THEN use this pattern. Otherwise it's
-over-engineering.
+**Rule of Three:** 3+ handle implementations per domain, genuinely
+different, AND code-extensible (new implementation addable without
+modifying existing controller/dispatch logic) → THEN use this pattern.
+Not 3+ domains with 1 implementation each. Otherwise it's over-engineering.
 
 ## What's Included
 
 ```
 controller-handle-architecture/
-├── SKILL.md                          ← Full pattern documentation
+├── SKILL.md                          ← Register/router with core guardrails
 ├── README.md                         ← This file
+├── CONTRIBUTING.md                   ← Skill authoring lessons (for maintainers)
 ├── templates/
 │   ├── java_template.java            ← Controller, Handle, ConcreteHandle, Composition Root
 │   ├── python_template.py            ← Same structure, Python-idiomatic
 │   ├── typescript_template.ts        ← Same structure for Tauri/frontend
-│   ├── java_optimizations.java       ← Lifecycle, EventBus, CircuitBreaker, Reloadable, Metrics
-│   └── python_optimizations.py       ← Same optimizations, Python-idiomatic
+│   ├── java_optimizations.java       ← Lifecycle, EventBus, CircuitBreaker, Reloadable, Metrics (snippets)
+│   ├── python_optimizations.py       ← Same optimizations, Python-idiomatic
+│   └── concurrency-testing.md        ← Race-condition tests for shared concurrent state
 └── references/
-    ├── lifecycle-circuit-breaker.md          ← O1 + O4 implementation notes
-    ├── multi-instance-session-routing.md     ← Multi-tenant session mapping
-    └── verification-phase-pattern.md         ← Migration verification checklist
+    ├── core-workflow.md              ← Principles detail, Bad/Good, anti-patterns, tests
+    ├── migration-workflow.md         ← Agent workflow, verification, handoff, subagent parallelization
+    ├── core-optimizations.md         ← O1-O8 enhancements + scaling S1-S6 + auto-registration
+    ├── composition-root-patterns.md  ← Multi-controller orchestration, test reset, init ordering
+    ├── handle-wrapping-patterns.md   ← Factory closures, enum-to-handle mapping, inline classes
+    ├── feature-toggle-pattern.md     ← Feature protocol, toggle controller, YAML config
+    ├── lifecycle-circuit-breaker.md  ← O1 + O4 implementation notes
+    ├── verification-phase-pattern.md ← Migration verification checklist
+    ├── multi-instance-session-routing.md ← Multi-tenant session mapping
+    └── external-codebase-analysis.md ← Workflow for analyzing external repos
 ```
 
-## Core Principles (1-10)
+## Architecture: Register + Progressive Disclosure
 
-1. One controller per domain
-2. Handle as interface/protocol — every handle implements `get_id()`
-3. Dynamic registration — no if/else, no modifying existing classes
-4. Insertion-ordered map — deterministic fallback chains
+SKILL.md is a **register/router** — a thin file (~140 lines) with core
+guardrails inline and a routing table that directs to detailed reference
+files. Load only what your case requires.
+
+The skill applies its own principle: Progressive Disclosure.
+
+- **SKILL.md** = Controller (register, route, guardrail)
+- **references/** = Handles (detailed execution, loaded on demand)
+- **Routing Table** = Dispatch (which references for which situation)
+- **Handoff** = Resume state for multi-phase migrations (in migration-workflow.md)
+
+## Core Digest (always active)
+
+1. Rule of Three first — <3 implementations per domain = no pattern
+2. One controller per domain, not per feature
+3. Handles implement behavior; controllers only register/resolve/orchestrate
+4. Composition Root is the sole wiring point — constructor injection, not lookup
 5. Wrap existing services, don't delete them
-6. Lazy imports/initialization — heavy deps load on first use
-7. Fail-fast on unknown handles — throw, never return null
-8. Decouple listeners — query the controller, not concrete implementations
-9. Config from YAML/JSON — modes and rules externalized
-10. Idempotent initialization — safe to call multiple times
+6. Fail loudly on unknown or duplicate handle IDs — no silent null
+7. Insertion-ordered map for deterministic fallback chains
+8. Tests are part of the output
+9. If the pattern is not justified, recommend the simpler design explicitly
+10. Context management: write handoff before context runs low
 
 ## Progressive Enhancements (O1-O8)
 
@@ -115,10 +144,10 @@ Three axes with different failure modes:
 
 - **Horizontal** (more handles): lazy init, auto-registration
 - **Vertical** (more controllers): modular composition root
-- **Functional** (more users): copy-on-write, thread safety, pooling
+- **Functional** (concurrent shared state): copy-on-write, thread safety, pooling
 
-See the Scaling Decision Table in SKILL.md for concrete recommendations
-by user count.
+See `references/core-optimizations.md` for the full scaling decision table
+(S1-S6) and prioritization by deployment context.
 
 ## Languages
 
@@ -132,11 +161,11 @@ language:
 
 ## Getting Started
 
-1. Read `SKILL.md` — the full pattern with decision matrices,
-   anti-patterns, and step-by-step setup guide
-2. Pick the template for your language from `templates/`
-3. Copy it into your project and adapt domain names
-4. Start with the core (Controller + Handle + Registry). Add
+1. Read `SKILL.md` — the register with core guardrails and routing table
+2. Load `references/core-workflow.md` — mandatory before generating code
+3. Pick the template for your language from `templates/`
+4. Copy it into your project and adapt domain names
+5. Start with the core (Controller + Handle + Registry). Add
    enhancements only when you hit the problem they solve
 
 ## Philosophy

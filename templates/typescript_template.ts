@@ -4,6 +4,10 @@
  * This template illustrates the Controller-Handle pattern for TypeScript.
  * It uses abstract domain names so you can adapt it to any project.
  *
+ * WARNING: ControllerRegistry.getInstance() and similar global getters
+ * are for the COMPOSITION ROOT only. Handles must NOT call them.
+ * Use constructor injection for handle dependencies.
+ *
  * Structure:
  *   1. Controller base class
  *   2. HandleBase interface
@@ -75,12 +79,12 @@ export abstract class Controller<H extends HandleBase> {
 
 /**
  * Every handle must implement this minimal contract.
- * The `id` uniquely identifies the handle within its controller;
- * `getDisplayName()` is intended for UI / logging purposes.
+ * Only `getId()` is part of the base contract.
+ * `getDisplayName()` is optional for UI/logging — add it to
+ * domain-specific handle interfaces where it's actually needed.
  */
 export interface HandleBase {
   getId(): string;
-  getDisplayName(): string;
 }
 
 // =====================================================================
@@ -91,8 +95,11 @@ export interface HandleBase {
  * Example domain interface for a "search" domain.
  * Replace this (and the concrete implementations below) with the
  * domain-specific contract you need for your project.
+ *
+ * Only getId() is required. Display name is optional for UI/logging.
  */
 export interface SearchHandle extends HandleBase {
+  getDisplayName?(): string; // optional — for UI/logging
   search(query: string, limit?: number, ...kwargs: any[]): any[];
 }
 

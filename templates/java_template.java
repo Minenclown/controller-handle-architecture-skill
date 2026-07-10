@@ -2,6 +2,7 @@
 // Generic, domain-agnostic reference implementation.
 // Replace DomainController / DomainHandle / ConcreteDomainHandle with your
 // own domain-specific names (e.g. UserController, UserHandle, …).
+// NOTE: In real Java projects, split each public type into its own file.
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -17,16 +18,18 @@ import java.util.Map;
 
 public class DomainController {
 
-    private final Application application;
     private final Map<String, DomainHandle> handles = new LinkedHashMap<>();
 
-    public DomainController(Application application) {
-        this.application = application;
+    public DomainController() {
     }
 
-    /** Register a handle under its reported id. Overwrites on duplicate ids. */
+    /** Register a handle. Throws on duplicate ids — no silent overwrite. */
     public void registerHandle(DomainHandle handle) {
-        handles.put(handle.getId(), handle);
+        String id = handle.getId();
+        if (handles.containsKey(id)) {
+            throw new IllegalArgumentException("Handle already registered: " + id);
+        }
+        handles.put(id, handle);
     }
 
     /** Look up a handle by id; throws if the id is not registered. */
@@ -46,6 +49,13 @@ public class DomainController {
     /** All registered handles, in registration order. */
     public List<DomainHandle> getHandles() {
         return new ArrayList<>(handles.values());
+    }
+
+    /** Remove a handle by id. Throws if not registered. */
+    public void unregisterHandle(String id) {
+        if (handles.remove(id) == null) {
+            throw new IllegalArgumentException("Unknown handle: " + id);
+        }
     }
 }
 
@@ -71,11 +81,9 @@ public interface DomainHandle {
 
 public class ConcreteDomainHandle implements DomainHandle {
 
-    private final Application application;
     private final ExistingService service;
 
-    public ConcreteDomainHandle(Application application, ExistingService service) {
-        this.application = application;
+    public ConcreteDomainHandle(ExistingService service) {
         this.service = service;
     }
 
@@ -100,18 +108,23 @@ public class ConcreteDomainHandle implements DomainHandle {
 public class Application {
 
     private DomainController domainController;
+    private boolean controllersInitialized = false;
 
     // Reference to an existing service that handles will wrap.
     private final ExistingService existingService = new ExistingService();
 
-    /** Build and wire all controllers and their handles. */
+    /** Build and wire all controllers and their handles. Idempotent. */
     public void initControllers() {
-        this.domainController = new DomainController(this);
+        if (controllersInitialized) return;
+
+        this.domainController = new DomainController();
         this.domainController.registerHandle(
-            new ConcreteDomainHandle(this, existingService)
+            new ConcreteDomainHandle(existingService)
         );
         // Register additional handles as needed:
-        // this.domainController.registerHandle(new AnotherDomainHandle(this));
+        // this.domainController.registerHandle(new AnotherDomainHandle(otherService));
+
+        controllersInitialized = true;
     }
 
     /** Public access to the controller for consumers. */

@@ -1,7 +1,7 @@
 """
 Template: Python optimizations for Controller-Handle architecture.
 
-This module provides reusable building blocks for production-grade controller
+This module provides reusable building blocks for enhanced controller
 subsystems: lifecycle hooks, an event bus, a circuit breaker, hot-reload
 support, an enhanced controller base with metrics, and a singleton registry
 wired to the event bus.
@@ -10,10 +10,11 @@ All identifiers use abstract placeholder names (DOMAIN_A_*, DOMAIN_B_*, etc.)
 so the template can be adapted to any project without leaking domain
 assumptions.
 
-Thread safety: the EnhancedController's metrics counters use a threading.Lock
-because compound dict operations (check-then-set: ``d[k] = d.get(k, 0) + 1``)
-are NOT atomic even under CPython's GIL. In a multi-threaded server (FastAPI,
-uvicorn workers) concurrent increments without a lock silently lose data.
+Thread safety: EnhancedController protects handle/breaker state with a
+threading.RLock and metrics counters with a separate threading.Lock.
+CircuitBreaker protects its own state. EventBus and ControllerRegistry remain
+unsynchronized reference implementations; add project-specific synchronization
+when they are shared across concurrent execution contexts.
 """
 
 # === Lifecycle Protocol ===
@@ -93,24 +94,28 @@ class CircuitBreaker:
         self._cooldown_sec = cooldown_sec
         self._errors: deque = deque()
         self._tripped_until: float = 0.0
+        self._lock = threading.RLock()
 
     def record_failure(self) -> None:
         """Record a failure and trip the breaker if the threshold is hit."""
-        now = time.time()
-        self._errors.append(now)
-        while self._errors and now - self._errors[0] > self._window_sec:
-            self._errors.popleft()
-        if len(self._errors) >= self._threshold:
-            self._tripped_until = now + self._cooldown_sec
+        with self._lock:
+            now = time.time()
+            self._errors.append(now)
+            while self._errors and now - self._errors[0] > self._window_sec:
+                self._errors.popleft()
+            if len(self._errors) >= self._threshold:
+                self._tripped_until = now + self._cooldown_sec
 
     def record_success(self) -> None:
         """Clear the failure window and reset the breaker."""
-        self._errors.clear()
-        self._tripped_until = 0.0
+        with self._lock:
+            self._errors.clear()
+            self._tripped_until = 0.0
 
     def is_tripped(self) -> bool:
         """True while the breaker is open and calls should be rejected."""
-        return time.time() < self._tripped_until
+        with self._lock:
+            return time.time() < self._tripped_until
 
 
 # === Reloadable Protocol ===
@@ -160,7 +165,7 @@ class HandleIds:
 
 # === Generic Controller base class ===
 
-from typing import TypeVar, Generic, Dict, List, Optional
+from typing import TypeVar, Generic, Dict, List, Optional, Mapping
 import logging
 import threading
 
@@ -214,74 +219,133 @@ class EnhancedController(Generic[H]):
         self._call_counts: Dict[str, int] = {}
         self._error_counts: Dict[str, int] = {}
         self._breakers: Dict[str, CircuitBreaker] = {}
+        self._state_lock = threading.RLock()  # protects _handles/_breakers
         self._metrics_lock = threading.Lock()  # protects _call_counts/_error_counts
 
     # --- registration ------------------------------------------------
 
     def register(self, handle: H) -> None:
         hid = handle.get_id()  # type: ignore[attr-defined]
-        if hid in self._handles:
-            raise ValueError(f"{self._name}: Handle '{hid}' already registered")
-        self._handles[hid] = handle
-        self._breakers[hid] = CircuitBreaker()
-        # Lifecycle hook
+        with self._state_lock:
+            if hid in self._handles:
+                raise ValueError(f"{self._name}: Handle '{hid}' already registered")
+            self._handles[hid] = handle
+            self._breakers[hid] = CircuitBreaker()
+
+        # Run user code outside the state lock.
         if hasattr(handle, "on_register"):
             handle.on_register()  # type: ignore[attr-defined]
         logger.debug("%s: registered handle '%s'", self._name, hid)
 
     def unregister(self, handle_id: str) -> None:
-        handle = self._handles.pop(handle_id, None)
+        with self._state_lock:
+            handle = self._handles.pop(handle_id, None)
+            if handle is not None:
+                self._breakers.pop(handle_id, None)
+
+        # Run user code outside the state lock.
         if handle is not None:
             if hasattr(handle, "on_disable"):
                 handle.on_disable()  # type: ignore[attr-defined]
-            self._breakers.pop(handle_id, None)
             logger.debug("%s: unregistered handle '%s'", self._name, handle_id)
+
+    def swap_handles(self, new_handles: Mapping[str, H]) -> None:
+        """Atomically replace the handle map for Copy-on-Write reloads.
+
+        Keys must match each handle's reported ID. Existing breakers are reused
+        for unchanged IDs; new IDs receive fresh breakers. Lifecycle hooks run
+        after the atomic swap and therefore never expose a partially built map.
+        """
+        candidate = dict(new_handles)
+        for hid, handle in candidate.items():
+            reported = handle.get_id()  # type: ignore[attr-defined]
+            if reported != hid:
+                raise ValueError(
+                    f"{self._name}: Mapping key '{hid}' does not match handle ID '{reported}'"
+                )
+
+        with self._state_lock:
+            previous = self._handles
+            previous_breakers = self._breakers
+            self._handles = candidate
+            self._breakers = {
+                hid: previous_breakers[hid]
+                if hid in previous and previous[hid] is candidate[hid]
+                else CircuitBreaker()
+                for hid in candidate
+            }
+
+        removed_or_replaced = [
+            handle for hid, handle in previous.items()
+            if hid not in candidate or candidate[hid] is not handle
+        ]
+        added_or_replaced = [
+            handle for hid, handle in candidate.items()
+            if hid not in previous or previous[hid] is not handle
+        ]
+        for handle in removed_or_replaced:
+            if hasattr(handle, "on_disable"):
+                handle.on_disable()  # type: ignore[attr-defined]
+        for handle in added_or_replaced:
+            if hasattr(handle, "on_register"):
+                handle.on_register()  # type: ignore[attr-defined]
 
     # --- lookups -----------------------------------------------------
 
     def get_handle(self, handle_id: str) -> H:
-        if handle_id not in self._handles:
-            raise KeyError(f"{self._name}: Unknown handle '{handle_id}'")
-        return self._handles[handle_id]
+        with self._state_lock:
+            if handle_id not in self._handles:
+                raise KeyError(f"{self._name}: Unknown handle '{handle_id}'")
+            return self._handles[handle_id]
 
     def has_handle(self, handle_id: str) -> bool:
-        return handle_id in self._handles
+        with self._state_lock:
+            return handle_id in self._handles
 
     def is_handle_available(self, handle_id: str) -> bool:
         """True when the handle exists and its breaker is closed."""
-        if not self.has_handle(handle_id):
-            return False
-        breaker = self._breakers.get(handle_id)
-        if breaker and breaker.is_tripped():
-            return False
-        return True
+        with self._state_lock:
+            if handle_id not in self._handles:
+                return False
+            breaker = self._breakers.get(handle_id)
+        return breaker is None or not breaker.is_tripped()
 
     def get_handles(self) -> List[H]:
-        return list(self._handles.values())
+        with self._state_lock:
+            return list(self._handles.values())
 
     def get_handle_ids(self) -> List[str]:
-        return list(self._handles.keys())
+        with self._state_lock:
+            return list(self._handles.keys())
 
     # --- invocation with metrics + breaker ---------------------------
 
     def call(self, handle_id: str, method_name: str, *args: Any, **kwargs: Any) -> Any:
         """Invoke *method_name* on *handle_id*, tracking metrics and breaker."""
+        with self._state_lock:
+            if handle_id not in self._handles:
+                raise KeyError(f"{self._name}: Unknown handle '{handle_id}'")
+            handle = self._handles[handle_id]
+            breaker = self._breakers[handle_id]
+
         with self._metrics_lock:
             self._call_counts[handle_id] = self._call_counts.get(handle_id, 0) + 1
-        handle = self.get_handle(handle_id)
+
         method = getattr(handle, method_name)
         try:
             result = method(*args, **kwargs)
-            self._breakers[handle_id].record_success()
+            breaker.record_success()
             return result
         except Exception:
             with self._metrics_lock:
                 self._error_counts[handle_id] = self._error_counts.get(handle_id, 0) + 1
-            self._breakers[handle_id].record_failure()
+            breaker.record_failure()
             raise
 
     def get_metrics(self) -> Dict[str, Any]:
         """Return per-handle call/error counts and current breaker state."""
+        with self._state_lock:
+            breaker_snapshot = dict(self._breakers)
         with self._metrics_lock:
             counts = dict(self._call_counts)
             errors = dict(self._error_counts)
@@ -289,9 +353,9 @@ class EnhancedController(Generic[H]):
             hid: {
                 "calls": counts.get(hid, 0),
                 "errors": errors.get(hid, 0),
-                "tripped": self._breakers[hid].is_tripped() if hid in self._breakers else False,
+                "tripped": breaker.is_tripped(),
             }
-            for hid in self.get_handle_ids()
+            for hid, breaker in breaker_snapshot.items()
         }
 
     # --- capability resolution --------------------------------------

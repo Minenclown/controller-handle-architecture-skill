@@ -1,11 +1,19 @@
 # Concurrency-Testing Template (Controller+Handle)
 
-Race condition tests for Controller+Handle in multi-user contexts.
-Only relevant for server deployments (5+ concurrent users).
-Single-user desktops do not need these tests.
+<!-- Python tests use EnhancedController from python_optimizations.py.
+     It synchronizes handle/breaker state, metrics, and Copy-on-Write swaps.
+     EventBus and ControllerRegistry remain reference implementations and need
+     project-specific synchronization when shared concurrently. Java examples
+     assume an equivalent thread-safe controller API. -->
+
+Race-condition tests for Controller+Handle with shared concurrent state.
+Use them whenever controller state can be read or mutated from multiple
+threads, tasks, workers, or request handlers. User count is not the deciding
+factor — a desktop app with workers or timers can race, while a truly
+single-threaded server path may not.
 
 See also: O4 (Circuit Breaker), O8 (Metrics/Observability),
-Scaling Axes — Axis 3 (functional/more users).
+Scaling Axes — Axis 3 (functional/concurrent access).
 
 ## What to Test
 
@@ -52,9 +60,9 @@ class FakeSearchHandle:
 # --- 1. Concurrent Register ---
 
 def test_concurrent_register():
-    from app.controllers.base import Controller
+    from python_optimizations import EnhancedController
 
-    ctrl = Controller("TestController")
+    ctrl = EnhancedController("TestController")
     barrier = threading.Barrier(3)
     errors = []
 
@@ -78,12 +86,43 @@ def test_concurrent_register():
     assert len(ctrl.get_handles()) == 3
 
 
+def test_concurrent_duplicate_register_allows_exactly_one():
+    from python_optimizations import EnhancedController
+
+    ctrl = EnhancedController("TestController")
+    barrier = threading.Barrier(8)
+    successes = []
+    duplicate_errors = []
+    unexpected_errors = []
+
+    def register_same_id():
+        barrier.wait()
+        try:
+            ctrl.register(FakeSearchHandle("same"))
+            successes.append(True)
+        except ValueError as exc:
+            duplicate_errors.append(exc)
+        except Exception as exc:
+            unexpected_errors.append(exc)
+
+    threads = [threading.Thread(target=register_same_id) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not unexpected_errors
+    assert len(successes) == 1
+    assert len(duplicate_errors) == 7
+    assert ctrl.get_handle("same").get_id() == "same"
+
+
 # --- 2. Concurrent Get ---
 
 def test_concurrent_get():
-    from app.controllers.base import Controller
+    from python_optimizations import EnhancedController
 
-    ctrl = Controller("TestController")
+    ctrl = EnhancedController("TestController")
     for i in range(5):
         ctrl.register(FakeSearchHandle(f"h{i}"))
 
@@ -109,11 +148,13 @@ def test_concurrent_get():
 
 
 # --- 3. Concurrent Metrics Increment ---
+# Note: call() and get_metrics() are EnhancedController methods
+# from python_optimizations.py, not in the basic Controller.
 
 def test_concurrent_metrics_increment():
-    from app.controllers.base import Controller
+    from python_optimizations import EnhancedController
 
-    ctrl = Controller("TestController")
+    ctrl = EnhancedController("TestController")
     ctrl.register(FakeSearchHandle("test"))
     barrier = threading.Barrier(10)
 
@@ -128,13 +169,14 @@ def test_concurrent_metrics_increment():
         t.join()
 
     metrics = ctrl.get_metrics()
-    assert metrics["calls"]["test.search"] == 10
+    # EnhancedController.get_metrics() returns {handle_id: {"calls": N, "errors": N, "tripped": bool}}
+    assert metrics["test"]["calls"] == 10
 
 
 # --- 4. Concurrent Circuit Breaker ---
 
 def test_concurrent_circuit_breaker():
-    from app.controllers.circuit_breaker import CircuitBreaker
+    from python_optimizations import CircuitBreaker
 
     breaker = CircuitBreaker(threshold=3, window_sec=30, cooldown_sec=60)
     barrier = threading.Barrier(5)
@@ -159,7 +201,7 @@ def test_concurrent_circuit_breaker():
 
 
 def test_concurrent_circuit_breaker_success():
-    from app.controllers.circuit_breaker import CircuitBreaker
+    from python_optimizations import CircuitBreaker
 
     breaker = CircuitBreaker(threshold=3, window_sec=30, cooldown_sec=60)
     barrier = threading.Barrier(5)
@@ -190,9 +232,9 @@ def test_concurrent_circuit_breaker_success():
 # --- 5. Concurrent Reload (Copy-on-Write) ---
 
 def test_concurrent_reload_and_get():
-    from app.controllers.base import Controller
+    from python_optimizations import EnhancedController
 
-    ctrl = Controller("TestController")
+    ctrl = EnhancedController("TestController")
     ctrl.register(FakeSearchHandle("h0"))
 
     barrier = threading.Barrier(2)
@@ -201,20 +243,18 @@ def test_concurrent_reload_and_get():
     def reload_loop():
         barrier.wait()
         try:
-            # Simulate reload: clear and re-register
-            ctrl.unregister("h0")
-            ctrl.register(FakeSearchHandle("h0"))
+            # Build a complete replacement map, then swap it atomically.
+            ctrl.swap_handles({"h0": FakeSearchHandle("h0")})
         except Exception as e:
             errors.append(e)
 
     def get_loop():
         barrier.wait()
-        time.sleep(0.001)  # slight delay so reload happens during gets
         try:
-            h = ctrl.get_handle("h0")
-            assert h.get_id() == "h0"
-        except KeyError:
-            pass  # expected: handle briefly unregistered during reload
+            for _ in range(500):
+                h = ctrl.get_handle("h0")
+                assert h.get_id() == "h0"
+                time.sleep(0)  # encourage thread interleaving
         except Exception as e:
             errors.append(e)
 
@@ -227,7 +267,7 @@ def test_concurrent_reload_and_get():
     for t in threads:
         t.join()
 
-    # No uncaught exceptions (KeyError from get is expected during reload)
+    # With COW, no errors should occur — the handle is always present.
     assert not errors, f"Unexpected errors: {errors}"
 ```
 
@@ -329,7 +369,7 @@ class ConcurrencyTest {
         for (int i = 0; i < callCount; i++) {
             threads[i] = Thread.startVirtualThread(() -> {
                 try { latch.await(); } catch (InterruptedException e) { return; }
-                metrics.recordCall("test.search");
+                metrics.recordCall("test");
             });
         }
 
@@ -382,8 +422,23 @@ class ConcurrencyTest {
         Runnable reloadTask = () -> {
             try { latch.await(); } catch (InterruptedException e) { return; }
             try {
-                ctrl.unregister("h0");
-                ctrl.registerHandle(new FakeXHandle("h0"));
+                // Copy-on-Write: build new map, atomically swap reference.
+                // Readers always see a consistent map — no window where
+                // the handle is briefly absent.
+                var oldHandles = ctrl.getHandles(); // snapshot current
+                var newHandles = new java.util.concurrent.ConcurrentHashMap<String, XHandle>();
+                for (var h : oldHandles) newHandles.put(h.getId(), h);
+                newHandles.put("h0", new FakeXHandle("h0")); // replacement
+                // Atomic reference swap — controller must expose a swap method
+                // or use AtomicReference internally for true COW.
+                // NOTE: swapHandles() is not on EnhancedController or DomainController.
+                // To use this pattern, add to your controller:
+                //   public void swapHandles(Map<String, DomainHandle> newMap) {
+                //       this.handles = newMap;
+                //   }
+                // Or use AtomicReference<Map<String, DomainHandle>> internally:
+                //   handlesRef.set(newMap);
+                ctrl.swapHandles(newHandles); // requires swapHandles() on controller
             } catch (Throwable t) { errors.add(t); }
         };
 
@@ -394,8 +449,6 @@ class ConcurrencyTest {
                 Thread.sleep(1);
                 var h = ctrl.getHandle("h0");
                 assertEquals("h0", h.getId());
-            } catch (IllegalArgumentException e) {
-                // Expected: handle briefly unregistered during reload
             } catch (Throwable t) { errors.add(t); }
         };
 
@@ -414,18 +467,21 @@ class ConcurrencyTest {
 
 ## When to Write These Tests
 
-| Deployment | Concurrency Tests Needed? | Reason |
-|------------|---------------------------|--------|
-| Single-User Desktop (Private) | No | GIL/Single-Thread sufficient |
-| Multi-User Server (Professional) | Yes | 5+ users = race conditions possible |
-| Game Server (10+ concurrent players) | Yes | Concurrent register/get/getHandle |
-| REST API with Multi-Tenant | Yes | Session routing + reload + metrics |
+The deciding factor is not user count, but whether multiple threads,
+tasks, workers, or request handlers access shared controller state.
+
+| Execution Model | Concurrency Tests Needed? | Reason |
+|-----------------|---------------------------|--------|
+| One execution context, no background work | Usually no | No concurrent access to controller state |
+| Multiple threads with shared state | Yes | Register/get/reload can interleave |
+| Async tasks | When mutation can interleave across awaits or thread-pool calls | Use async-specific tests in addition to these thread tests |
+| Multiple processes | Controller memory is isolated | Test external coordination/service discovery separately |
 
 ## Thread-Safety Primitives Reference
 
 | Language | Map | Counter | Atomic Swap |
 |----------|-----|---------|-------------|
-| Python | `dict` + `threading.Lock` | `collections.Counter` or `Lock` | `self._handles = new_handles` (GIL-atomic for dict reference) |
+| Python | `dict` + `threading.RLock` | `collections.Counter` or `Lock` | Swap under the same state lock via `swap_handles()` |
 | Java | `ConcurrentHashMap` | `AtomicInteger` / `AtomicLong` | `AtomicReference<Map>` for COW |
 | Rust | `DashMap` or `RwLock<HashMap>` | `AtomicUsize` | `Arc<Swap<Map>>` |
 | Go | `sync.Map` | `atomic.Int64` | Swap via `atomic.Value` |
